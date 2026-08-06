@@ -76,7 +76,10 @@ def monthly_series(df: pd.DataFrame) -> pd.DataFrame:
 
 
 
-def prepare_year_month_trend(df: pd.DataFrame) -> pd.DataFrame:
+def prepare_year_month_trend(
+    df: pd.DataFrame,
+    fill_historical_gaps: bool = False,
+) -> pd.DataFrame:
     """Create a Jan-Dec comparison structure with one series per year."""
     source = df.dropna(subset=["Fecha"]).copy()
     columns = [
@@ -85,6 +88,7 @@ def prepare_year_month_trend(df: pd.DataFrame) -> pd.DataFrame:
         "MesComparacion",
         "ValorVenta",
         "VentaAcumulada",
+        "TieneRegistros",
     ]
     if source.empty:
         return pd.DataFrame(columns=columns)
@@ -96,13 +100,14 @@ def prepare_year_month_trend(df: pd.DataFrame) -> pd.DataFrame:
         source.groupby(
             ["AñoComparacion", "MesNumeroComparacion"],
             as_index=False,
-        )["ValorVenta"]
-        .sum()
+        )
+        .agg(
+            ValorVenta=("ValorVenta", "sum"),
+            TieneRegistros=("ValorVenta", "size"),
+        )
         .sort_values(["AñoComparacion", "MesNumeroComparacion"])
     )
-    observed["VentaAcumulada"] = (
-        observed.groupby("AñoComparacion")["ValorVenta"].cumsum()
-    )
+    observed["TieneRegistros"] = observed["TieneRegistros"] > 0
 
     years = sorted(observed["AñoComparacion"].unique())
     full_grid = pd.MultiIndex.from_product(
@@ -116,15 +121,49 @@ def prepare_year_month_trend(df: pd.DataFrame) -> pd.DataFrame:
         how="left",
     )
     result["MesComparacion"] = result["MesNumeroComparacion"].map(MONTH_SHORT)
-    return result[columns]
+    result["TieneRegistros"] = result["TieneRegistros"].fillna(False)
 
+    min_period = source["Fecha"].min().to_period("M")
+    max_period = source["Fecha"].max().to_period("M")
+    result["PeriodoComparacion"] = pd.PeriodIndex(
+        result["AñoComparacion"].astype(str)
+        + "-"
+        + result["MesNumeroComparacion"].astype(str).str.zfill(2),
+        freq="M",
+    )
+    result["DentroCobertura"] = (
+        (result["PeriodoComparacion"] >= min_period)
+        & (result["PeriodoComparacion"] <= max_period)
+    )
+
+    if fill_historical_gaps:
+        historical_gap = (
+            result["DentroCobertura"]
+            & ~result["TieneRegistros"]
+        )
+        result.loc[historical_gap, "ValorVenta"] = 0.0
+
+    result["VentaAcumulada"] = (
+        result.groupby("AñoComparacion")["ValorVenta"]
+        .transform(lambda series: series.fillna(0).cumsum())
+    )
+
+    # Months after the latest available month must remain blank, not zero.
+    result.loc[~result["DentroCobertura"], "VentaAcumulada"] = pd.NA
+
+    return result[columns + ["DentroCobertura"]]
 
 def build_year_comparison_chart(
     df: pd.DataFrame,
     mode: str = "Ventas mensuales",
     title: str | None = None,
+    missing_mode: str = "Mantener vacío",
 ):
-    trend = prepare_year_month_trend(df)
+    fill_historical_gaps = missing_mode == "Mostrar como cero"
+    trend = prepare_year_month_trend(
+        df,
+        fill_historical_gaps=fill_historical_gaps,
+    )
     if trend.empty or trend["ValorVenta"].notna().sum() == 0:
         return None
 
@@ -136,6 +175,10 @@ def build_year_comparison_chart(
         else "Comparativo mensual de ventas por año"
     )
 
+    trend["EstadoDato"] = trend["TieneRegistros"].map(
+        {True: "Con registros", False: "Sin registros"}
+    )
+
     fig = px.line(
         trend,
         x="MesNumeroComparacion",
@@ -143,6 +186,7 @@ def build_year_comparison_chart(
         color="AñoComparacion",
         markers=True,
         hover_name="MesComparacion",
+        custom_data=["EstadoDato"],
         title=chart_title,
         labels={
             "AñoComparacion": "Año",
@@ -155,6 +199,13 @@ def build_year_comparison_chart(
         connectgaps=False,
         line={"width": 3},
         marker={"size": 8},
+        hovertemplate=(
+            "<b>%{hovertext}</b><br>"
+            "Año: %{fullData.name}<br>"
+            "Valor: $%{y:,.0f}<br>"
+            "Estado: %{customdata[0]}"
+            "<extra></extra>"
+        ),
     )
     fig.update_xaxes(
         tickmode="array",
@@ -185,7 +236,6 @@ def build_year_comparison_chart(
         margin={"l": 20, "r": 20, "t": 85, "b": 35},
     )
     return fig
-
 
 def filtered_base_without_dates(
     prepared: pd.DataFrame,
@@ -277,6 +327,16 @@ if valid_dates.empty:
 min_date = valid_dates.min().date()
 max_date = valid_dates.max().date()
 
+source_months = pd.period_range(
+    valid_dates.min().to_period("M"),
+    valid_dates.max().to_period("M"),
+    freq="M",
+)
+observed_source_months = set(valid_dates.dt.to_period("M").unique())
+missing_source_months = [
+    period for period in source_months if period not in observed_source_months
+]
+
 MONTH_NAMES = {
     1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril",
     5: "Mayo", 6: "Junio", 7: "Julio", 8: "Agosto",
@@ -286,6 +346,23 @@ MONTH_SHORT = {
     1: "Ene", 2: "Feb", 3: "Mar", 4: "Abr", 5: "May", 6: "Jun",
     7: "Jul", 8: "Ago", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dic",
 }
+
+if missing_source_months:
+    missing_labels = ", ".join(
+        f"{MONTH_NAMES[period.month]} de {period.year}"
+        for period in missing_source_months
+    )
+    st.warning(
+        "Cobertura incompleta en el archivo: no existen filas para "
+        f"{missing_labels}. Estos meses se muestran como vacíos para no "
+        "confundir ausencia de información con ventas reales de cero."
+    )
+
+if min_date.day != 1 or max_date.day < 28:
+    st.info(
+        f"Cobertura del archivo: {min_date:%d/%m/%Y} a {max_date:%d/%m/%Y}. "
+        "El primer o el último mes pueden ser periodos parciales."
+    )
 
 with st.sidebar:
     st.header("Filtros")
@@ -300,21 +377,16 @@ with st.sidebar:
         help="Selecciona uno o varios años para comparar sus meses.",
     )
 
-    months_in_selected_years = prepared.copy()
-    if selected_years:
-        months_in_selected_years = months_in_selected_years[
-            months_in_selected_years["Año"].isin(selected_years)
-        ]
-    available_month_numbers = sorted(
-        int(month)
-        for month in months_in_selected_years["MesNumero"].dropna().unique()
-    )
+    available_month_numbers = list(range(1, 13))
     available_month_names = [MONTH_NAMES[month] for month in available_month_numbers]
     selected_month_names = st.multiselect(
         "Mes",
         available_month_names,
         default=available_month_names,
-        help="El filtro conserva el mismo mes para todos los años seleccionados.",
+        help=(
+            "Se muestran los doce meses, incluso cuando el archivo no contiene "
+            "registros para alguno de ellos."
+        ),
     )
     selected_month_numbers = [
         month for month, name in MONTH_NAMES.items() if name in selected_month_names
@@ -375,6 +447,16 @@ with st.sidebar:
         help=(
             "La comparación usa enero a diciembre en el eje horizontal "
             "y una línea independiente por cada año."
+        ),
+    )
+    missing_month_mode = st.radio(
+        "Meses sin registros",
+        ["Mantener vacío", "Mostrar como cero"],
+        horizontal=True,
+        help=(
+            "Mantener vacío evita interpretar una ausencia de datos como una venta "
+            "real de cero. Mostrar como cero solo afecta meses históricos dentro de "
+            "la cobertura del archivo."
         ),
     )
     top_n = st.slider("Cantidad en rankings", 5, 30, 10)
@@ -482,6 +564,7 @@ with tab_exec:
             if trend_mode == "Ventas mensuales"
             else "Ventas acumuladas comparadas por año"
         ),
+        missing_mode=missing_month_mode,
     )
 
     if executive_chart is None:
@@ -525,7 +608,10 @@ with tab_exec:
             st.plotly_chart(fig, use_container_width=True)
 
     with summary_right:
-        monthly_table = prepare_year_month_trend(filtered)
+        monthly_table = prepare_year_month_trend(
+            filtered,
+            fill_historical_gaps=missing_month_mode == "Mostrar como cero",
+        )
         monthly_table = monthly_table[
             monthly_table["ValorVenta"].notna()
         ].copy()
@@ -542,7 +628,7 @@ with tab_exec:
             pivot.index.name = "Mes"
             st.subheader("Ventas mensuales por año")
             st.dataframe(
-                pivot.style.format("${:,.0f}", na_rep="—"),
+                pivot.style.format("${:,.0f}", na_rep="Sin registros"),
                 use_container_width=True,
                 height=390,
             )
@@ -735,6 +821,7 @@ with tab_trends:
             if trend_mode == "Ventas mensuales"
             else "Evolución acumulada de ventas por año"
         ),
+        missing_mode=missing_month_mode,
     )
 
     if trend_chart is None:
@@ -742,7 +829,10 @@ with tab_trends:
     else:
         st.plotly_chart(trend_chart, use_container_width=True)
 
-        comparison_data = prepare_year_month_trend(filtered)
+        comparison_data = prepare_year_month_trend(
+            filtered,
+            fill_historical_gaps=missing_month_mode == "Mostrar como cero",
+        )
         value_column = (
             "VentaAcumulada"
             if trend_mode == "Ventas acumuladas"
@@ -770,7 +860,7 @@ with tab_trends:
                 else "Matriz de ventas mensuales"
             )
             st.dataframe(
-                comparison_pivot.style.format("${:,.0f}", na_rep="—"),
+                comparison_pivot.style.format("${:,.0f}", na_rep="Sin registros"),
                 use_container_width=True,
             )
 
@@ -793,6 +883,65 @@ with tab_trends:
             st.plotly_chart(fig, use_container_width=True)
 
 with tab_quality:
+    st.subheader("Cobertura mensual de la fuente")
+    coverage = prepared.dropna(subset=["Fecha"]).copy()
+    coverage["AñoMesCobertura"] = coverage["Fecha"].dt.to_period("M")
+    coverage_summary = (
+        coverage.groupby("AñoMesCobertura", as_index=False)
+        .agg(
+            Filas=("Documento", "size"),
+            VentasRegistradas=("ValorVenta", "sum"),
+            FechaMinima=("Fecha", "min"),
+            FechaMaxima=("Fecha", "max"),
+        )
+    )
+
+    complete_periods = pd.DataFrame({
+        "AñoMesCobertura": pd.period_range(
+            prepared["Fecha"].min().to_period("M"),
+            prepared["Fecha"].max().to_period("M"),
+            freq="M",
+        )
+    })
+    coverage_summary = complete_periods.merge(
+        coverage_summary,
+        on="AñoMesCobertura",
+        how="left",
+    )
+    coverage_summary["Estado"] = coverage_summary["Filas"].apply(
+        lambda value: "Sin registros" if pd.isna(value) else "Con registros"
+    )
+    coverage_summary["Periodo"] = coverage_summary["AñoMesCobertura"].astype(str)
+
+    st.dataframe(
+        coverage_summary[
+            [
+                "Periodo",
+                "Estado",
+                "Filas",
+                "VentasRegistradas",
+                "FechaMinima",
+                "FechaMaxima",
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "VentasRegistradas": st.column_config.NumberColumn(
+                "Ventas registradas",
+                format="$ %.0f",
+            ),
+            "FechaMinima": st.column_config.DateColumn(
+                "Primera fecha",
+                format="DD/MM/YYYY",
+            ),
+            "FechaMaxima": st.column_config.DateColumn(
+                "Última fecha",
+                format="DD/MM/YYYY",
+            ),
+        },
+    )
+
     q1, q2, q3, q4 = st.columns(4)
     q1.metric("Fechas inválidas", int(prepared["Fecha"].isna().sum()))
     q2.metric("Valores inválidos", int(prepared["ValorVenta"].isna().sum()))
