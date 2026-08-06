@@ -80,6 +80,7 @@ def filtered_base_without_dates(
     statuses,
     warehouses,
     clients,
+    references,
     products,
     exclude_freight,
 ) -> pd.DataFrame:
@@ -90,6 +91,8 @@ def filtered_base_without_dates(
         result = result[result["Bodega"].isin(warehouses)]
     if clients:
         result = result[result["Cliente"].isin(clients)]
+    if references:
+        result = result[result["Referencia"].isin(references)]
     if products:
         result = result[result["Producto"].isin(products)]
     if exclude_freight:
@@ -99,8 +102,8 @@ def filtered_base_without_dates(
 
 st.title("📊 Aplicación de análisis de ventas")
 st.caption(
-    "Sube un archivo Excel, filtra la información y analiza el comportamiento "
-    "diario, mensual e interanual."
+    "Sube un archivo Excel, filtra por año, mes, cliente, producto o ISBN "
+    "y analiza el comportamiento diario, mensual e interanual."
 )
 
 uploaded = st.file_uploader(
@@ -162,14 +165,55 @@ if valid_dates.empty:
 min_date = valid_dates.min().date()
 max_date = valid_dates.max().date()
 
+MONTH_NAMES = {
+    1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril",
+    5: "Mayo", 6: "Junio", 7: "Julio", 8: "Agosto",
+    9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre",
+}
+MONTH_SHORT = {
+    1: "Ene", 2: "Feb", 3: "Mar", 4: "Abr", 5: "May", 6: "Jun",
+    7: "Jul", 8: "Ago", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dic",
+}
+
 with st.sidebar:
     st.header("Filtros")
+
+    available_years = sorted(
+        int(year) for year in prepared["Año"].dropna().unique()
+    )
+    selected_years = st.multiselect(
+        "Año",
+        available_years,
+        default=available_years,
+        help="Selecciona uno o varios años para comparar sus meses.",
+    )
+
+    months_in_selected_years = prepared.copy()
+    if selected_years:
+        months_in_selected_years = months_in_selected_years[
+            months_in_selected_years["Año"].isin(selected_years)
+        ]
+    available_month_numbers = sorted(
+        int(month)
+        for month in months_in_selected_years["MesNumero"].dropna().unique()
+    )
+    available_month_names = [MONTH_NAMES[month] for month in available_month_numbers]
+    selected_month_names = st.multiselect(
+        "Mes",
+        available_month_names,
+        default=available_month_names,
+        help="El filtro conserva el mismo mes para todos los años seleccionados.",
+    )
+    selected_month_numbers = [
+        month for month, name in MONTH_NAMES.items() if name in selected_month_names
+    ]
 
     date_range = st.date_input(
         "Rango de fechas",
         value=(min_date, max_date),
         min_value=min_date,
         max_value=max_date,
+        help="Permite afinar el análisis dentro de los años y meses seleccionados.",
     )
     if isinstance(date_range, tuple) and len(date_range) == 2:
         start_date, end_date = date_range
@@ -186,13 +230,35 @@ with st.sidebar:
     clients = sorted(x for x in prepared["Cliente"].dropna().unique() if x)
     selected_clients = st.multiselect("Cliente", clients)
 
-    products = sorted(x for x in prepared["Producto"].dropna().unique() if x)
+    references = sorted(
+        str(x).strip()
+        for x in prepared["Referencia"].dropna().unique()
+        if str(x).strip()
+    )
+    selected_references = st.multiselect(
+        "Referencia / ISBN",
+        references,
+        help=(
+            "Escribe el ISBN o código de referencia para localizarlo. "
+            "El filtro actualiza todos los indicadores y gráficos."
+        ),
+        placeholder="Buscar ISBN o referencia",
+    )
+
+    products_for_filter = prepared.copy()
+    if selected_references:
+        products_for_filter = products_for_filter[
+            products_for_filter["Referencia"].isin(selected_references)
+        ]
+    products = sorted(
+        x for x in products_for_filter["Producto"].dropna().unique() if x
+    )
     selected_products = st.multiselect("Producto", products)
 
     exclude_freight = st.checkbox("Excluir SERVICIO FLETE", value=True)
     granularity = st.radio(
-        "Granularidad de tendencia",
-        ["Día", "Mes", "Año"],
+        "Vista de tendencia",
+        ["Día", "Mes", "Comparativo anual"],
         horizontal=True,
     )
     top_n = st.slider("Cantidad en rankings", 5, 30, 10)
@@ -208,25 +274,45 @@ filtered = apply_dimension_filters(
     exclude_freight,
 )
 
+if selected_references:
+    filtered = filtered[filtered["Referencia"].isin(selected_references)]
+
+if selected_years:
+    filtered = filtered[filtered["Año"].isin(selected_years)]
+if selected_month_numbers:
+    filtered = filtered[filtered["MesNumero"].isin(selected_month_numbers)]
+
 base_dimensions = filtered_base_without_dates(
     prepared,
     selected_statuses,
     selected_warehouses,
     selected_clients,
+    selected_references,
     selected_products,
     exclude_freight,
 )
 
+comparison_start = (
+    filtered["Fecha"].min().date()
+    if not filtered.empty and filtered["Fecha"].notna().any()
+    else start_date
+)
+comparison_end = (
+    filtered["Fecha"].max().date()
+    if not filtered.empty and filtered["Fecha"].notna().any()
+    else end_date
+)
+
 previous_month = comparison_window(
     base_dimensions,
-    start_date,
-    end_date,
+    comparison_start,
+    comparison_end,
     pd.DateOffset(months=1),
 )
 previous_year = comparison_window(
     base_dimensions,
-    start_date,
-    end_date,
+    comparison_start,
+    comparison_end,
     pd.DateOffset(years=1),
 )
 
@@ -234,8 +320,16 @@ metrics = calculate_metrics(filtered)
 metrics_pm = calculate_metrics(previous_month)
 metrics_py = calculate_metrics(previous_year)
 
-mom = change_pct(metrics.sales, metrics_pm.sales)
-yoy = change_pct(metrics.sales, metrics_py.sales)
+mom = (
+    change_pct(metrics.sales, metrics_pm.sales)
+    if len(selected_years) == 1 and len(selected_month_numbers) == 1
+    else None
+)
+yoy = (
+    change_pct(metrics.sales, metrics_py.sales)
+    if len(selected_years) == 1
+    else None
+)
 
 st.markdown(
     f'<p class="small-note">Periodo analizado: {start_date:%d/%m/%Y} a '
@@ -244,7 +338,8 @@ st.markdown(
 )
 
 k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
-k1.metric("Ventas", money(metrics.sales), delta_text(mom) + " mes")
+sales_delta = f"{mom:+.2%} vs mes anterior" if mom is not None else None
+k1.metric("Ventas", money(metrics.sales), sales_delta)
 k2.metric("Pedidos", number(metrics.orders))
 k3.metric("Clientes", number(metrics.clients))
 k4.metric("Productos", number(metrics.products))
@@ -266,27 +361,56 @@ with tab_exec:
     left, right = st.columns([1.7, 1])
 
     trend = filtered.dropna(subset=["Fecha"]).copy()
-    if granularity == "Día":
-        trend["Periodo"] = trend["Fecha"]
-    elif granularity == "Mes":
-        trend["Periodo"] = trend["Fecha"].dt.to_period("M").dt.to_timestamp()
-    else:
-        trend["Periodo"] = trend["Fecha"].dt.to_period("Y").dt.to_timestamp()
-
-    trend = trend.groupby("Periodo", as_index=False)["ValorVenta"].sum()
 
     with left:
-        fig = px.line(
-            trend,
-            x="Periodo",
-            y="ValorVenta",
-            markers=True,
-            title=f"Tendencia de ventas por {granularity.lower()}",
-        )
+        if granularity == "Comparativo anual":
+            trend["AñoComparacion"] = trend["Fecha"].dt.year.astype(str)
+            trend["MesNumeroComparacion"] = trend["Fecha"].dt.month
+            trend["MesComparacion"] = trend["MesNumeroComparacion"].map(MONTH_SHORT)
+            trend = (
+                trend.groupby(
+                    ["AñoComparacion", "MesNumeroComparacion", "MesComparacion"],
+                    as_index=False,
+                )["ValorVenta"]
+                .sum()
+                .sort_values(["AñoComparacion", "MesNumeroComparacion"])
+            )
+            fig = px.line(
+                trend,
+                x="MesNumeroComparacion",
+                y="ValorVenta",
+                color="AñoComparacion",
+                markers=True,
+                hover_name="MesComparacion",
+                title="Comparativo año a año por mes",
+                labels={"AñoComparacion": "Año"},
+            )
+            fig.update_xaxes(
+                tickmode="array",
+                tickvals=list(range(1, 13)),
+                ticktext=[MONTH_SHORT[month] for month in range(1, 13)],
+                title="Mes",
+            )
+        else:
+            if granularity == "Día":
+                trend["Periodo"] = trend["Fecha"]
+            else:
+                trend["Periodo"] = trend["Fecha"].dt.to_period("M").dt.to_timestamp()
+
+            trend = trend.groupby("Periodo", as_index=False)["ValorVenta"].sum()
+            fig = px.line(
+                trend,
+                x="Periodo",
+                y="ValorVenta",
+                markers=True,
+                title=f"Tendencia de ventas por {granularity.lower()}",
+            )
+            fig.update_xaxes(title="Periodo")
+
         fig.update_layout(
-            xaxis_title="Periodo",
             yaxis_title="Ventas",
             hovermode="x unified",
+            legend_title_text="Año",
         )
         fig.update_yaxes(tickprefix="$", separatethousands=True)
         st.plotly_chart(fig, use_container_width=True)
@@ -411,6 +535,18 @@ with tab_clients:
     )
 
 with tab_products:
+    if selected_references:
+        reference_metrics = calculate_metrics(filtered)
+        st.subheader("Resultado de la referencia / ISBN seleccionada")
+        ref1, ref2, ref3, ref4 = st.columns(4)
+        ref1.metric("Ventas de la referencia", money(reference_metrics.sales))
+        ref2.metric("Pedidos", number(reference_metrics.orders))
+        ref3.metric("Unidades", number(reference_metrics.units))
+        ref4.metric("Clientes", number(reference_metrics.clients))
+        st.caption(
+            "Referencia(s) seleccionada(s): " + ", ".join(selected_references)
+        )
+
     product_summary = (
         filtered.groupby(["Referencia", "Producto"], as_index=False)
         .agg(
@@ -455,13 +591,17 @@ with tab_products:
         use_container_width=True,
         hide_index=True,
         column_config={
+            "Referencia": st.column_config.TextColumn(
+                "Referencia / ISBN",
+                help="Código de referencia o ISBN del producto",
+            ),
             "Ventas": st.column_config.NumberColumn(format="$ %.0f"),
             "Participacion": st.column_config.NumberColumn(format="%.2f%%"),
         },
     )
 
 with tab_trends:
-    monthly = monthly_series(base_dimensions)
+    monthly = monthly_series(filtered)
 
     fig = px.bar(
         monthly,
@@ -472,8 +612,8 @@ with tab_trends:
     fig.update_yaxes(tickprefix="$", separatethousands=True)
     st.plotly_chart(fig, use_container_width=True)
 
-    yoy_source = base_dimensions.dropna(subset=["Fecha"]).copy()
-    yoy_source["Año"] = yoy_source["Fecha"].dt.year
+    yoy_source = filtered.dropna(subset=["Fecha"]).copy()
+    yoy_source["Año"] = yoy_source["Fecha"].dt.year.astype(str)
     yoy_source["MesNumero"] = yoy_source["Fecha"].dt.month
     yoy_source["Mes"] = yoy_source["Fecha"].dt.strftime("%b")
     yoy_monthly = (
