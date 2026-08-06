@@ -237,6 +237,133 @@ def build_year_comparison_chart(
     )
     return fig
 
+
+def build_budget_comparison(
+    sales_df: pd.DataFrame,
+    selected_years,
+    selected_months,
+    start_date,
+    end_date,
+    data_max_date,
+) -> pd.DataFrame:
+    actual = sales_df.dropna(subset=["Fecha"]).copy()
+    actual_by_month = {}
+
+    if not actual.empty:
+        actual["AñoPresupuesto"] = actual["Fecha"].dt.year
+        actual["MesPresupuesto"] = actual["Fecha"].dt.month
+        actual_by_month = (
+            actual.groupby(["AñoPresupuesto", "MesPresupuesto"])["ValorVenta"]
+            .sum()
+            .to_dict()
+        )
+
+    rows = []
+    for year in selected_years:
+        year = int(year)
+        year_budget = CORPORATE_BUDGETS.get(year)
+        if not year_budget:
+            continue
+
+        for month, budget in year_budget.items():
+            if selected_months and month not in selected_months:
+                continue
+
+            period_start = pd.Timestamp(year=year, month=month, day=1)
+            period_end = period_start + pd.offsets.MonthEnd(0)
+
+            if period_end.date() < start_date or period_start.date() > end_date:
+                continue
+
+            is_future = period_start.date() > data_max_date
+            is_partial = (
+                year == data_max_date.year
+                and month == data_max_date.month
+                and data_max_date < period_end.date()
+            )
+
+            if is_future:
+                actual_value = pd.NA
+                difference = pd.NA
+                compliance_pct = pd.NA
+                status = "Pendiente"
+            else:
+                actual_value = float(actual_by_month.get((year, month), 0.0))
+                difference = actual_value - budget
+                compliance_pct = actual_value / budget * 100 if budget else pd.NA
+
+                if is_partial:
+                    status = f"Parcial al {data_max_date:%d/%m/%Y}"
+                elif compliance_pct >= 100:
+                    status = "Cumplido"
+                elif compliance_pct >= 90:
+                    status = "En riesgo"
+                else:
+                    status = "Bajo meta"
+
+            rows.append(
+                {
+                    "Año": year,
+                    "MesNumero": month,
+                    "Mes": MONTH_NAMES[month],
+                    "Presupuesto": float(budget),
+                    "Ventas reales": actual_value,
+                    "Diferencia": difference,
+                    "Cumplimiento %": compliance_pct,
+                    "Estado": status,
+                    "Es futuro": is_future,
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def build_budget_chart(comparison: pd.DataFrame):
+    if comparison.empty:
+        return None
+
+    chart_data = comparison.copy()
+    chart_data["Periodo"] = (
+        chart_data["Mes"].str[:3] + " " + chart_data["Año"].astype(str)
+    )
+
+    fig = go.Figure()
+    fig.add_bar(
+        x=chart_data["Periodo"],
+        y=chart_data["Ventas reales"],
+        name="Ventas reales",
+    )
+    fig.add_scatter(
+        x=chart_data["Periodo"],
+        y=chart_data["Presupuesto"],
+        name="Presupuesto",
+        mode="lines+markers",
+        line={"width": 3},
+        marker={"size": 8},
+    )
+    fig.update_layout(
+        title="Presupuesto frente a ventas reales",
+        height=460,
+        hovermode="x unified",
+        legend={
+            "orientation": "h",
+            "yanchor": "bottom",
+            "y": 1.02,
+            "xanchor": "center",
+            "x": 0.5,
+        },
+        margin={"l": 20, "r": 20, "t": 85, "b": 40},
+    )
+    fig.update_xaxes(title="Mes")
+    fig.update_yaxes(
+        title="Valor",
+        tickprefix="$",
+        tickformat="~s",
+        rangemode="tozero",
+    )
+    return fig
+
+
 def filtered_base_without_dates(
     prepared: pd.DataFrame,
     statuses,
@@ -345,6 +472,23 @@ MONTH_NAMES = {
 MONTH_SHORT = {
     1: "Ene", 2: "Feb", 3: "Mar", 4: "Abr", 5: "May", 6: "Jun",
     7: "Jul", 8: "Ago", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dic",
+}
+
+CORPORATE_BUDGETS = {
+    2026: {
+        1: 43242750,
+        2: 49420286,
+        3: 49420286,
+        4: 49420286,
+        5: 49420286,
+        6: 49420286,
+        7: 49420286,
+        8: 49420286,
+        9: 49420286,
+        10: 61775357,
+        11: 61775357,
+        12: 55597821,
+    }
 }
 
 if missing_source_months:
@@ -475,10 +619,34 @@ filtered = apply_dimension_filters(
 if selected_references:
     filtered = filtered[filtered["Referencia"].isin(selected_references)]
 
+budget_sales_base = apply_dimension_filters(
+    prepared,
+    start_date,
+    end_date,
+    selected_statuses,
+    [],
+    [],
+    [],
+    exclude_freight,
+)
+
 if selected_years:
     filtered = filtered[filtered["Año"].isin(selected_years)]
+    budget_sales_base = budget_sales_base[
+        budget_sales_base["Año"].isin(selected_years)
+    ]
+else:
+    filtered = filtered.iloc[0:0]
+    budget_sales_base = budget_sales_base.iloc[0:0]
+
 if selected_month_numbers:
     filtered = filtered[filtered["MesNumero"].isin(selected_month_numbers)]
+    budget_sales_base = budget_sales_base[
+        budget_sales_base["MesNumero"].isin(selected_month_numbers)
+    ]
+else:
+    filtered = filtered.iloc[0:0]
+    budget_sales_base = budget_sales_base.iloc[0:0]
 
 base_dimensions = filtered_base_without_dates(
     prepared,
@@ -556,6 +724,108 @@ tab_exec, tab_clients, tab_products, tab_trends, tab_quality = st.tabs(
 )
 
 with tab_exec:
+    budget_comparison = build_budget_comparison(
+        budget_sales_base,
+        selected_years,
+        selected_month_numbers,
+        start_date,
+        end_date,
+        max_date,
+    )
+
+    if not budget_comparison.empty:
+        st.subheader("Cumplimiento del presupuesto comercial")
+
+        configured_years = sorted(budget_comparison["Año"].unique())
+        annual_budget = sum(
+            sum(CORPORATE_BUDGETS[year].values())
+            for year in configured_years
+            if year in CORPORATE_BUDGETS
+        )
+
+        available_rows = budget_comparison[~budget_comparison["Es futuro"]]
+        comparable_budget = available_rows["Presupuesto"].sum()
+        comparable_sales = available_rows["Ventas reales"].fillna(0).sum()
+        compliance = (
+            comparable_sales / comparable_budget
+            if comparable_budget
+            else None
+        )
+        gap = comparable_sales - comparable_budget
+
+        b1, b2, b3, b4, b5 = st.columns(5)
+        b1.metric("Presupuesto anual configurado", money(annual_budget))
+        b2.metric("Presupuesto periodo disponible", money(comparable_budget))
+        b3.metric("Ventas reales del periodo", money(comparable_sales))
+        b4.metric(
+            "Cumplimiento",
+            f"{compliance:.1%}" if compliance is not None else "Sin base",
+        )
+        b5.metric("Brecha", money(gap))
+
+        if any(
+            [
+                selected_warehouses,
+                selected_clients,
+                selected_references,
+                selected_products,
+            ]
+        ):
+            st.info(
+                "El presupuesto es corporativo y no está distribuido por bodega, "
+                "cliente, producto o ISBN. Este bloque conserva el total general "
+                "y responde a Año, Mes, rango de fechas, Estado y flete."
+            )
+
+        budget_chart = build_budget_chart(budget_comparison)
+        if budget_chart is not None:
+            st.plotly_chart(budget_chart, use_container_width=True)
+
+        budget_table = budget_comparison[
+            [
+                "Año",
+                "MesNumero",
+                "Mes",
+                "Presupuesto",
+                "Ventas reales",
+                "Diferencia",
+                "Cumplimiento %",
+                "Estado",
+            ]
+        ].sort_values(["Año", "MesNumero"])
+
+        st.dataframe(
+            budget_table.drop(columns=["MesNumero"]),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Presupuesto": st.column_config.NumberColumn(
+                    "Presupuesto", format="$ %.0f"
+                ),
+                "Ventas reales": st.column_config.NumberColumn(
+                    "Ventas reales", format="$ %.0f"
+                ),
+                "Diferencia": st.column_config.NumberColumn(
+                    "Diferencia", format="$ %.0f"
+                ),
+                "Cumplimiento %": st.column_config.NumberColumn(
+                    "Cumplimiento %", format="%.1f%%"
+                ),
+            },
+        )
+        st.caption(
+            "Los meses posteriores a la última fecha cargada aparecen como "
+            "Pendiente. El mes en curso se identifica como periodo parcial."
+        )
+        st.divider()
+    elif any(year in CORPORATE_BUDGETS for year in selected_years):
+        st.info("No hay meses presupuestales dentro del periodo seleccionado.")
+    else:
+        st.info(
+            "No hay presupuesto configurado para los años seleccionados. "
+            "Actualmente está disponible el presupuesto corporativo de 2026."
+        )
+
     executive_chart = build_year_comparison_chart(
         filtered,
         mode=trend_mode,
