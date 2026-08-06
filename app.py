@@ -363,7 +363,27 @@ with tab_exec:
     trend = filtered.dropna(subset=["Fecha"]).copy()
 
     with left:
-        if granularity == "Comparativo anual":
+        if trend.empty:
+            st.info("No hay información disponible para la tendencia seleccionada.")
+        elif granularity == "Día":
+            trend["AñoComparacion"] = trend["Fecha"].dt.year.astype(str)
+            trend = (
+                trend.groupby(["AñoComparacion", "Fecha"], as_index=False)["ValorVenta"]
+                .sum()
+                .sort_values(["AñoComparacion", "Fecha"])
+            )
+            fig = px.line(
+                trend,
+                x="Fecha",
+                y="ValorVenta",
+                color="AñoComparacion",
+                markers=True,
+                title="Tendencia diaria de ventas por año",
+                labels={"AñoComparacion": "Año"},
+            )
+            fig.update_xaxes(title="Fecha")
+
+        elif granularity == "Mes":
             trend["AñoComparacion"] = trend["Fecha"].dt.year.astype(str)
             trend["MesNumeroComparacion"] = trend["Fecha"].dt.month
             trend["MesComparacion"] = trend["MesNumeroComparacion"].map(MONTH_SHORT)
@@ -382,7 +402,7 @@ with tab_exec:
                 color="AñoComparacion",
                 markers=True,
                 hover_name="MesComparacion",
-                title="Comparativo año a año por mes",
+                title="Ventas mensuales comparadas por año",
                 labels={"AñoComparacion": "Año"},
             )
             fig.update_xaxes(
@@ -391,29 +411,48 @@ with tab_exec:
                 ticktext=[MONTH_SHORT[month] for month in range(1, 13)],
                 title="Mes",
             )
-        else:
-            if granularity == "Día":
-                trend["Periodo"] = trend["Fecha"]
-            else:
-                trend["Periodo"] = trend["Fecha"].dt.to_period("M").dt.to_timestamp()
 
-            trend = trend.groupby("Periodo", as_index=False)["ValorVenta"].sum()
+        else:
+            trend["AñoComparacion"] = trend["Fecha"].dt.year.astype(str)
+            trend["MesNumeroComparacion"] = trend["Fecha"].dt.month
+            trend["MesComparacion"] = trend["MesNumeroComparacion"].map(MONTH_SHORT)
+            trend = (
+                trend.groupby(
+                    ["AñoComparacion", "MesNumeroComparacion", "MesComparacion"],
+                    as_index=False,
+                )["ValorVenta"]
+                .sum()
+                .sort_values(["AñoComparacion", "MesNumeroComparacion"])
+            )
+            trend["VentaAcumulada"] = trend.groupby("AñoComparacion")["ValorVenta"].cumsum()
             fig = px.line(
                 trend,
-                x="Periodo",
-                y="ValorVenta",
+                x="MesNumeroComparacion",
+                y="VentaAcumulada",
+                color="AñoComparacion",
                 markers=True,
-                title=f"Tendencia de ventas por {granularity.lower()}",
+                hover_name="MesComparacion",
+                title="Ventas acumuladas comparadas por año",
+                labels={
+                    "AñoComparacion": "Año",
+                    "VentaAcumulada": "Ventas acumuladas",
+                },
             )
-            fig.update_xaxes(title="Periodo")
+            fig.update_xaxes(
+                tickmode="array",
+                tickvals=list(range(1, 13)),
+                ticktext=[MONTH_SHORT[month] for month in range(1, 13)],
+                title="Mes",
+            )
 
-        fig.update_layout(
-            yaxis_title="Ventas",
-            hovermode="x unified",
-            legend_title_text="Año",
-        )
-        fig.update_yaxes(tickprefix="$", separatethousands=True)
-        st.plotly_chart(fig, use_container_width=True)
+        if not trend.empty:
+            fig.update_layout(
+                yaxis_title="Valor de ventas",
+                hovermode="x unified",
+                legend_title_text="Año",
+            )
+            fig.update_yaxes(tickprefix="$", separatethousands=True)
+            st.plotly_chart(fig, use_container_width=True)
 
     with right:
         warehouse = (
@@ -601,61 +640,104 @@ with tab_products:
     )
 
 with tab_trends:
-    monthly = monthly_series(filtered)
+    trend_source = filtered.dropna(subset=["Fecha"]).copy()
 
-    fig = px.bar(
-        monthly,
-        x="Periodo",
-        y="ValorVenta",
-        title="Comportamiento mes a mes",
-    )
-    fig.update_yaxes(tickprefix="$", separatethousands=True)
-    st.plotly_chart(fig, use_container_width=True)
+    if trend_source.empty:
+        st.info("No hay información disponible para construir las tendencias.")
+    else:
+        trend_source["AñoComparacion"] = trend_source["Fecha"].dt.year.astype(str)
+        trend_source["MesNumeroComparacion"] = trend_source["Fecha"].dt.month
+        trend_source["MesComparacion"] = trend_source["MesNumeroComparacion"].map(MONTH_SHORT)
 
-    yoy_source = filtered.dropna(subset=["Fecha"]).copy()
-    yoy_source["Año"] = yoy_source["Fecha"].dt.year.astype(str)
-    yoy_source["MesNumero"] = yoy_source["Fecha"].dt.month
-    yoy_source["Mes"] = yoy_source["Fecha"].dt.strftime("%b")
-    yoy_monthly = (
-        yoy_source.groupby(["Año", "MesNumero", "Mes"], as_index=False)["ValorVenta"]
-        .sum()
-        .sort_values(["Año", "MesNumero"])
-    )
+        monthly_comparison = (
+            trend_source.groupby(
+                ["AñoComparacion", "MesNumeroComparacion", "MesComparacion"],
+                as_index=False,
+            )["ValorVenta"]
+            .sum()
+            .sort_values(["AñoComparacion", "MesNumeroComparacion"])
+        )
 
-    fig = px.line(
-        yoy_monthly,
-        x="MesNumero",
-        y="ValorVenta",
-        color="Año",
-        markers=True,
-        hover_name="Mes",
-        title="Comparativo año a año por mes",
-    )
-    fig.update_xaxes(
-        tickmode="array",
-        tickvals=list(range(1, 13)),
-        ticktext=[
-            "Ene", "Feb", "Mar", "Abr", "May", "Jun",
-            "Jul", "Ago", "Sep", "Oct", "Nov", "Dic",
-        ],
-        title="Mes",
-    )
-    fig.update_yaxes(tickprefix="$", separatethousands=True)
-    st.plotly_chart(fig, use_container_width=True)
+        fig = px.line(
+            monthly_comparison,
+            x="MesNumeroComparacion",
+            y="ValorVenta",
+            color="AñoComparacion",
+            markers=True,
+            hover_name="MesComparacion",
+            title="Evolución mensual de ventas por año",
+            labels={
+                "AñoComparacion": "Año",
+                "ValorVenta": "Valor de ventas",
+            },
+        )
+        fig.update_xaxes(
+            tickmode="array",
+            tickvals=list(range(1, 13)),
+            ticktext=[MONTH_SHORT[month] for month in range(1, 13)],
+            title="Mes",
+        )
+        fig.update_yaxes(
+            title="Valor de ventas",
+            tickprefix="$",
+            separatethousands=True,
+        )
+        fig.update_layout(
+            hovermode="x unified",
+            legend_title_text="Año",
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
-    weekday = (
-        filtered.groupby(["DiaSemanaNumero", "DiaSemana"], as_index=False)["ValorVenta"]
-        .sum()
-        .sort_values("DiaSemanaNumero")
-    )
-    fig = px.bar(
-        weekday,
-        x="DiaSemana",
-        y="ValorVenta",
-        title="Ventas por día de la semana",
-    )
-    fig.update_yaxes(tickprefix="$", separatethousands=True)
-    st.plotly_chart(fig, use_container_width=True)
+        cumulative = monthly_comparison.copy()
+        cumulative["VentaAcumulada"] = (
+            cumulative.groupby("AñoComparacion")["ValorVenta"].cumsum()
+        )
+
+        fig = px.line(
+            cumulative,
+            x="MesNumeroComparacion",
+            y="VentaAcumulada",
+            color="AñoComparacion",
+            markers=True,
+            hover_name="MesComparacion",
+            title="Ventas acumuladas año a año",
+            labels={
+                "AñoComparacion": "Año",
+                "VentaAcumulada": "Ventas acumuladas",
+            },
+        )
+        fig.update_xaxes(
+            tickmode="array",
+            tickvals=list(range(1, 13)),
+            ticktext=[MONTH_SHORT[month] for month in range(1, 13)],
+            title="Mes",
+        )
+        fig.update_yaxes(
+            title="Valor de ventas acumulado",
+            tickprefix="$",
+            separatethousands=True,
+        )
+        fig.update_layout(
+            hovermode="x unified",
+            legend_title_text="Año",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        weekday = (
+            filtered.groupby(
+                ["DiaSemanaNumero", "DiaSemana"], as_index=False
+            )["ValorVenta"]
+            .sum()
+            .sort_values("DiaSemanaNumero")
+        )
+        fig = px.bar(
+            weekday,
+            x="DiaSemana",
+            y="ValorVenta",
+            title="Ventas por día de la semana",
+        )
+        fig.update_yaxes(tickprefix="$", separatethousands=True)
+        st.plotly_chart(fig, use_container_width=True)
 
 with tab_quality:
     q1, q2, q3, q4 = st.columns(4)
